@@ -1,0 +1,187 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Compliance Helper MVP - Evidence capture & control mapping
+
+Parameters:
+  EvidenceBucketName:
+    Type: String
+    Description: S3 bucket name for evidence artifacts
+  KmsAlias:
+    Type: String
+    Default: alias/compliance-helper
+    Description: KMS alias used for S3 SSE-KMS and parameter encryption
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 60
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        EVIDENCE_BUCKET: !Ref EvidenceBucketName
+        TABLE_NAME: !Ref EvidenceTable
+        KMS_ALIAS: !Ref KmsAlias
+    Policies:
+      - AWSLambdaBasicExecutionRole
+
+Resources:
+
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Compliance Helper evidence
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable Root
+            Effect: Allow
+            Principal: { AWS: !Sub arn:aws:iam::${AWS::AccountId}:root }
+            Action: 'kms:*'
+            Resource: '*'
+  KmsAliasRes:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Ref KmsAlias
+      TargetKeyId: !Ref KmsKey
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref EvidenceBucketName
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EvidenceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: createdAt-index
+          KeySchema:
+            - AttributeName: createdAt
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  EvidenceCollectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/collectors/
+      Handler: aws_s3.handler
+      Policies:
+        - Statement:
+            - Sid: S3ListAndGet
+              Effect: Allow
+              Action:
+                - s3:ListAllMyBuckets
+                - s3:ListBucket
+                - s3:GetBucketLocation
+                - s3:GetBucketEncryption
+                - s3:GetBucketPolicyStatus
+                - s3:GetBucketPublicAccessBlock
+                - s3:GetBucketVersioning
+              Resource: "*"
+            - Sid: PutEvidence
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectTagging
+              Resource: !Sub arn:aws:s3:::${EvidenceBucket}/*
+            - Sid: Dynamo
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt EvidenceTable.Arn
+            - Sid: KMS
+              Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:GenerateDataKey*
+              Resource: !Ref KmsKey
+
+  CollectorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EvidenceCollectorFunction.Arn
+          Id: CollectorTarget
+    DependsOn: EvidenceCollectorFunction
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EvidenceCollectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CollectorSchedule.Arn
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: app.handler
+      Events:
+        ApiProxy:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: any
+      Policies:
+        - Statement:
+            - Sid: ReadEvidence
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:GetItem
+              Resource: !GetAtt EvidenceTable.Arn
+            - Sid: ReadWriteEvidenceBucket
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${EvidenceBucket}/*
+            - Sid: S3Presign
+              Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${EvidenceBucket}
+            - Sid: KMS
+              Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:GenerateDataKey*
+              Resource: !Ref KmsKey
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/
+  EvidenceBucketOut:
+    Description: Evidence bucket name
+    Value: !Ref EvidenceBucketName
+  EvidenceTableOut:
+    Description: Evidence table
+    Value: !Ref EvidenceTable
